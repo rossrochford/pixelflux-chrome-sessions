@@ -172,7 +172,11 @@ offers the modifiers the encoder's display imports) and a memfd frame is read in
 metadata delivers the host's own cursor sprite to the cursor callback, and the stream is asked
 for at most the capture's frame rate. Portal input takes the lower-latency **libei** channel where
 the backend answers `ConnectToEIS` — one socket for keyboard, pointer, and touch, and the path the
-GNOME and KDE backends develop — and the portal's own `Notify*` methods otherwise. A successful
+GNOME and KDE backends develop — and the portal's own `Notify*` methods otherwise. On a scaled output
+the pointer lands in each path's own space: libei's regions in the compositor's logical space, and
+`NotifyPointerMotionAbsolute` in the stream's logical size as the spec has it, or in its pixels where
+Mutter serves the session, as Mutter reads them; a finger's scroll goes in the logical pixels of the
+output under the pointer. A successful
 `ConnectToEIS` makes the session refuse `Notify*`, so libei is taken only once its handshake binds a
 device; keys resolve against the compositor's own keymap that libei delivers, with a raw-keycode
 fallback, while the `Notify*` path travels keysyms the host applies its layout to. The portal's consent dialog, where a

@@ -72,6 +72,9 @@ pub struct PortalSession {
     pub rd_version: u32,
     /// KDE's backend serves the session: it reads a smooth scroll's vertical axis negated.
     kde: bool,
+    /// Mutter's remote-desktop service runs on the session bus, which every GNOME backend hands
+    /// input to: it places absolute pointer motion in the stream's pixels (`pointer_motion_abs`).
+    mutter: bool,
     /// Whether dropping the session closes it on the portal: not while `open` still runs it
     /// inside its `zbus::block_on`, which a second one inside would panic on.
     armed: bool,
@@ -169,12 +172,12 @@ async fn next_message<S: Stream + Unpin>(stream: &mut S) -> Option<S::Item> {
     std::future::poll_fn(|cx| Pin::new(&mut *stream).poll_next(cx)).await
 }
 
-/// Whether KDE's portal backend owns its name on the bus `conn` is on.
-async fn kde_backend(conn: &Connection) -> bool {
+/// Whether `name` has an owner on the bus `conn` is on.
+async fn name_owned(conn: &Connection, name: &str) -> bool {
     let Ok(bus) = zbus::fdo::DBusProxy::new(conn).await else {
         return false;
     };
-    let Ok(name) = zbus::names::BusName::try_from("org.freedesktop.impl.portal.desktop.kde") else {
+    let Ok(name) = zbus::names::BusName::try_from(name) else {
         return false;
     };
     bus.name_has_owner(name).await.unwrap_or(false)
@@ -232,6 +235,7 @@ impl PortalSession {
             restore_token: None,
             rd_version: 0,
             kde: false,
+            mutter: false,
             armed: false,
         })
     }
@@ -353,7 +357,10 @@ impl PortalSession {
             return Err("the portal started no monitor stream".into());
         }
         // The backend has answered Start, so it runs by now; the frontend names none.
-        self.kde = self.remote.is_some() && kde_backend(&self.conn).await;
+        self.kde = self.remote.is_some()
+            && name_owned(&self.conn, "org.freedesktop.impl.portal.desktop.kde").await;
+        self.mutter =
+            self.remote.is_some() && name_owned(&self.conn, "org.gnome.Mutter.RemoteDesktop").await;
         Ok(())
     }
 
@@ -467,8 +474,13 @@ impl PortalSession {
         }
     }
 
-    /// Absolute pointer motion in the logical coordinate space of the stream `node`.
-    pub fn pointer_motion_abs(&self, node: u32, x: f64, y: f64) {
+    /// Absolute pointer motion over the stream `node`, given as the point in the stream's logical
+    /// space (the `size` it announced) and in its pixels. The spec and KDE's backend take the
+    /// logical point; Mutter takes the pixels, dividing them by the monitor's scale itself where
+    /// its stage views are scaled (`meta_screen_cast_monitor_stream_transform_position`), so a
+    /// session Mutter serves is handed those, whichever backend passes them on.
+    pub fn pointer_motion_abs(&self, node: u32, logical: (f64, f64), pixels: (f64, f64)) {
+        let (x, y) = if self.mutter { pixels } else { logical };
         self.notify(
             "NotifyPointerMotionAbsolute",
             &(self.session.clone(), Options::new(), node, x, y),

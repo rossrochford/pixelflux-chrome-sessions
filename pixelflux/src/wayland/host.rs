@@ -1021,6 +1021,9 @@ pub struct HostSession {
     alive: Arc<AtomicBool>,
     /// A finger's scroll the uinput wheels have not taken yet, in pixels (`pointer_scroll`).
     scroll_carry: Mutex<(f64, f64)>,
+    /// The union-layout point the last absolute motion went to, whose output's scale a
+    /// finger's scroll is taken by (`pointer_scroll`).
+    pointer_at: Mutex<(f64, f64)>,
 }
 
 impl HostSession {
@@ -1140,6 +1143,7 @@ impl HostSession {
                     OutputGeom {
                         pos: state.positions.get(i).copied().unwrap_or((0, 0)),
                         logical: (size.0 / scale, size.1 / scale),
+                        mode: size,
                     }
                 })
                 .collect()
@@ -1264,6 +1268,7 @@ impl HostSession {
             layouts,
             alive,
             scroll_carry: Mutex::new((0.0, 0.0)),
+            pointer_at: Mutex::new((0.0, 0.0)),
         })
     }
 
@@ -1692,33 +1697,83 @@ impl HostSession {
         (w, h)
     }
 
-    /// The portal stream under a union-layout point and the point in that stream's logical
-    /// space: the active display whose slot holds the point (else the nearest slot), paired
-    /// with its stream by rank.
-    fn portal_target(&self, x: f64, y: f64) -> Option<(u32, f64, f64)> {
+    /// The portal stream under a union-layout point and where the point lands on it: the active
+    /// display whose slot holds the point (else the nearest slot), paired with its stream by
+    /// rank.
+    fn portal_target(&self, x: f64, y: f64) -> Option<PortalPoint> {
         let live = self.portal.as_ref()?.live()?;
-        let slots: Vec<LayoutSlot> = {
-            let layout = self.layout.lock().unwrap();
-            layout
-                .values()
-                .filter(|s| s.active)
-                .copied()
-                .take(self.outputs.len())
-                .collect()
-        };
+        let slots = self.active_slots();
         let rank = nearest_slot(&slots, x, y)?;
         let assignment = assign_streams(&live.session.streams, &self.geoms);
         let stream = &live.session.streams[(*assignment.get(rank)?)?];
         let slot = &slots[rank];
-        let (sx, sy) = stream_point(slot, stream.size.unwrap_or(slot.want), x, y);
-        Some((stream.node_id, sx, sy))
+        let mode = self
+            .geoms
+            .get(rank)
+            .map(|g| g.mode)
+            .filter(|m| m.0 > 0 && m.1 > 0)
+            .unwrap_or(slot.want);
+        Some(PortalPoint {
+            node: stream.node_id,
+            logical: stream_point(slot, stream.size.unwrap_or(slot.want), x, y),
+            pixels: stream_point(slot, mode, x, y),
+            position: stream.position,
+        })
     }
 
+    /// The active, output-backed displays' slots, by rank.
+    fn active_slots(&self) -> Vec<LayoutSlot> {
+        let layout = self.layout.lock().unwrap();
+        layout
+            .values()
+            .filter(|s| s.active)
+            .copied()
+            .take(self.outputs.len())
+            .collect()
+    }
+
+    /// The scale of the host output under a union-layout point: its display's capture size
+    /// over the logical size the portal's stream announces for it, else the output's mode
+    /// over its integer scale.
+    fn scale_at(&self, x: f64, y: f64) -> f64 {
+        let slots = self.active_slots();
+        let Some(rank) = nearest_slot(&slots, x, y) else {
+            return 1.0;
+        };
+        let logical = self
+            .portal
+            .as_ref()
+            .and_then(|c| c.live())
+            .and_then(|live| {
+                let assignment = assign_streams(&live.session.streams, &self.geoms);
+                live.session.streams[(*assignment.get(rank)?)?].size
+            })
+            .or_else(|| self.geoms.get(rank).map(|g| g.logical));
+        match logical {
+            Some((w, _)) if w > 0 && slots[rank].want.0 > 0 => slots[rank].want.0 as f64 / w as f64,
+            _ => 1.0,
+        }
+    }
+
+    /// Absolute motion to a union-layout point, the physical space selkies injects in. libei
+    /// takes it in the compositor's logical space, where EIS regions lie: the stream's
+    /// position plus the point in its logical size. A union layout with no stream position
+    /// to place it by goes as it is, which is that space on an unscaled host.
     pub fn pointer_motion_abs(&self, x: f64, y: f64) {
+        *self.pointer_at.lock().unwrap() = (x, y);
         if let Some(live) = self.portal_ei() {
+            let ei = live.ei.as_ref().unwrap();
+            if let Some(PortalPoint {
+                logical,
+                position: Some(pos),
+                ..
+            }) = self.portal_target(x, y)
+            {
+                ei.pointer_motion_abs(pos.0 as f64 + logical.0, pos.1 as f64 + logical.1);
+                return;
+            }
             let (w, h) = self.extent();
             if w > 0 && h > 0 {
-                let ei = live.ei.as_ref().unwrap();
                 ei.pointer_motion_abs(x.clamp(0.0, (w - 1) as f64), y.clamp(0.0, (h - 1) as f64));
             }
             return;
@@ -1739,8 +1794,8 @@ impl HostSession {
                         u.pointer
                             .emit(crate::uinput::EV_ABS, crate::uinput::ABS_Y, scale(y, h));
                 }
-            } else if let Some((node, sx, sy)) = self.portal_target(x, y) {
-                self.with_portal(|p| p.pointer_motion_abs(node, sx, sy));
+            } else if let Some(t) = self.portal_target(x, y) {
+                self.with_portal(|p| p.pointer_motion_abs(t.node, t.logical, t.pixels));
             }
             return;
         };
@@ -1914,13 +1969,18 @@ fn scroll_notches(carry: &mut f64, delta: f64) -> i32 {
 }
 
 impl HostSession {
-    /// A finger's scroll by (dx, dy) pixels on the host: smooth, as a finger source ended by
-    /// `pointer_scroll_end`, through libei, the portal or the virtual pointer, and in whole
-    /// wheel notches with the remainder carried on uinput, whose wheels have no other.
+    /// A finger's scroll by (dx, dy) pixels of the stream on the host, in the logical pixels of
+    /// the output under the pointer as the nested compositor takes it: smooth, as a finger
+    /// source ended by `pointer_scroll_end`, through libei, the portal or the virtual pointer,
+    /// and in whole wheel notches with the remainder carried on uinput, whose wheels have no
+    /// other.
     pub fn pointer_scroll(&self, dx: f64, dy: f64) {
         if dx == 0.0 && dy == 0.0 {
             return;
         }
+        let (px, py) = *self.pointer_at.lock().unwrap();
+        let scale = self.scale_at(px, py);
+        let (dx, dy) = (dx / scale, dy / scale);
         if let Some(live) = self.portal_ei() {
             live.ei.as_ref().unwrap().pointer_axis(dx, dy, false);
             return;
@@ -2023,9 +2083,20 @@ fn nearest_slot(slots: &[LayoutSlot], x: f64, y: f64) -> Option<usize> {
         .map(|(rank, _)| rank)
 }
 
-/// A union-layout point in the logical space of the stream behind `slot`: the slot captures
-/// its output at physical size `want`, the portal addresses it at logical size `logical`.
-fn stream_point(slot: &LayoutSlot, logical: (i32, i32), x: f64, y: f64) -> (f64, f64) {
+/// Where a union-layout point lands on the portal stream under it (`HostSession::portal_target`).
+struct PortalPoint {
+    node: u32,
+    /// In the stream's logical space, the size the portal announced for it.
+    logical: (f64, f64),
+    /// In the stream's pixels, its output's mode.
+    pixels: (f64, f64),
+    /// The stream's position in the compositor's logical space, where the portal gave one.
+    position: Option<(i32, i32)>,
+}
+
+/// A union-layout point in a space of size `to` over the stream behind `slot`, which captures
+/// its output at physical size `want`: its logical size or its pixels.
+fn stream_point(slot: &LayoutSlot, to: (i32, i32), x: f64, y: f64) -> (f64, f64) {
     let scale = |v: f64, from: i32, to: i32| {
         let mapped = if from > 0 {
             v * to as f64 / from as f64
@@ -2035,8 +2106,8 @@ fn stream_point(slot: &LayoutSlot, logical: (i32, i32), x: f64, y: f64) -> (f64,
         mapped.clamp(0.0, (to.max(1) - 1) as f64)
     };
     (
-        scale(x - slot.pos.0 as f64, slot.want.0, logical.0),
-        scale(y - slot.pos.1 as f64, slot.want.1, logical.1),
+        scale(x - slot.pos.0 as f64, slot.want.0, to.0),
+        scale(y - slot.pos.1 as f64, slot.want.1, to.1),
     )
 }
 
@@ -2066,6 +2137,8 @@ pub(crate) struct OutputGeom {
     pos: (i32, i32),
     /// Mode divided by the integer scale.
     logical: (i32, i32),
+    /// Mode, the output's size in pixels.
+    mode: (i32, i32),
 }
 
 /// Which portal stream backs each output rank: the stream announcing the output's position,
@@ -3896,5 +3969,31 @@ mod tests {
         assert_eq!(ledger.outcome(third), Some(false));
         let fourth = ledger.issue();
         assert_eq!(ledger.outcome(fourth), None);
+    }
+
+    /// A point on a display captured at an output's mode, scale 2, beside another: the
+    /// stream's logical space (the portal's `size`) holds it at half, its pixels as it is.
+    #[test]
+    fn stream_point_maps_to_logical_size_and_pixels() {
+        let slot = LayoutSlot {
+            want: (4080, 2304),
+            pos: (1920, 0),
+            active: true,
+            zero_copy: false,
+            paint_cursor: false,
+            fps_milli: 60_000,
+        };
+        assert_eq!(
+            stream_point(&slot, (2040, 1152), 1920.0 + 3000.0, 2000.0),
+            (1500.0, 1000.0)
+        );
+        assert_eq!(
+            stream_point(&slot, (4080, 2304), 1920.0 + 3000.0, 2000.0),
+            (3000.0, 2000.0)
+        );
+        assert_eq!(
+            stream_point(&slot, (2040, 1152), 1920.0 + 9000.0, -5.0),
+            (2039.0, 0.0)
+        );
     }
 }
