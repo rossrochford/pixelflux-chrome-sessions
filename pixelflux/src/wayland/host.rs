@@ -1396,18 +1396,8 @@ impl HostSession {
             if rank >= self.outputs.len() {
                 break;
             }
-            // A mode change invalidates everything buffered for this output:
-            // those frames belong to the old geometry and would otherwise be
-            // consumed at the new one.
-            let size_mismatch = self.outputs[rank]
-                .retained
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|f| f.width != slot.want.0 || f.height != slot.want.1);
-            if size_mismatch {
-                self.drop_buffered_frames(rank);
-            }
+            // Frames buffered at another size stay: the capture consumes only frames of its own
+            // size, and a host that keeps its own mode brings the capture back to theirs.
             self.outputs[rank].send(slot.start());
             by_output.push(*slot);
         }
@@ -1494,11 +1484,10 @@ impl HostSession {
         }
     }
 
-    /// Drop every buffered frame for an output: a mode or buffer-type change
-    /// makes the cached pixels unusable — consumed at the new geometry they
-    /// smear garbage rows or fault an encoder built for the new size. The
-    /// slots go straight back to the pool; dropping them silently would wedge
-    /// a slot until the next renegotiation.
+    /// Drop every buffered frame for an output: a buffer-type change or a parked
+    /// output leaves them without a consumer. The slots go straight back to the
+    /// pool; dropping them silently would wedge a slot until the next
+    /// renegotiation.
     fn drop_buffered_frames(&self, idx: usize) {
         let handle = &self.outputs[idx];
         if let Some(old) = handle.retained.lock().unwrap().take() {

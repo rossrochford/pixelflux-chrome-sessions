@@ -3855,17 +3855,18 @@ fn render_node_tick(
         // The session steps out of `state` while frames are adopted so the
         // renderer can composite the watermark / serve screenshot readbacks.
         let host = state.host.take().unwrap();
-        // Stale-geometry rejection: a frame captured before a mode change is
-        // useless at the new size (the CPU path would blit old-pitch rows into
-        // a new-size buffer, and HW encoders cannot take a mismatched dmabuf),
-        // so it goes back to the pool instead of being retained or encoded.
+        // A frame of another size than this capture's is not encoded (the CPU path would blit
+        // old-pitch rows into a new-size buffer, and HW encoders cannot take a mismatched
+        // dmabuf), but it is the host's newest picture, so it is retained: a host that keeps
+        // its own mode brings the capture back to its size, and a quiet one may send nothing
+        // else for that capture to show.
         let expect = node
             .capture
             .as_ref()
             .map(|c| (c.settings.width, c.settings.height));
         let new_frame = match (host.try_take_frame(host_idx), expect) {
             (Some(f), Some((w, h))) if f.width != w || f.height != h => {
-                host.release_frame(host_idx, f);
+                host.retain_frame(host_idx, f);
                 None
             }
             (f, _) => f,
@@ -3938,6 +3939,13 @@ fn render_node_tick(
         let mut wm_drawn = false;
         let outcome = host.with_retained(host_idx, |r| {
             let Some(f) = r else { return RETAINED_NONE };
+            if (f.width, f.height) != (width, height) {
+                if take_screenshot {
+                    screenshot_result =
+                        Some(Err("Screenshot host frame has stale dimensions".to_string()));
+                }
+                return RETAINED_NONE;
+            }
             damage_rects = if have_new {
                 f.damage.clone()
             } else {
@@ -3948,14 +3956,11 @@ fn render_node_tick(
                     return RETAINED_CPU_FRAME;
                 }
                 if take_screenshot {
-                    screenshot_result = Some(if (f.width, f.height) == (width, height) {
-                        validate_host_screenshot(cpu, width, height).map(|format| {
+                    screenshot_result =
+                        Some(validate_host_screenshot(cpu, width, height).map(|format| {
                             screenshot_format = format;
                             ShotPixels::Rendered
-                        })
-                    } else {
-                        Err("Screenshot host frame has stale dimensions".to_string())
-                    });
+                        }));
                 }
                 if let Some((_, ref mut buf)) = pool_slot {
                     cpu.write_bgra(f.width, f.height, buf);
