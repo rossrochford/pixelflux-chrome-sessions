@@ -169,8 +169,10 @@ picks its rung from the registry, so a KWin that serves `ext-image-copy-capture`
 `zwlr-virtual-pointer` gets its frames natively and its pointer from the portal. The compositor
 owns the portal's buffers: a dmabuf frame is imported by the encoder where it lies (the stream
 offers the modifiers the encoder's display imports) and a memfd frame is read in place, cursor
-metadata delivers the host's own cursor sprite to the cursor callback, and the stream is asked
-for at most the capture's frame rate. Portal input takes the lower-latency **libei** channel where
+metadata delivers the host's own cursor sprite to the cursor callback (KWin sends a cursor's image
+once per change of cursor, so if the stream's first frame is replaced before it arrives, the sprite
+stays missing until the cursor next changes shape), and the stream is asked for at most the
+capture's frame rate. Portal input takes the lower-latency **libei** channel where
 the backend answers `ConnectToEIS` — one socket for keyboard, pointer, and touch, and the path the
 GNOME and KDE backends develop — and the portal's own `Notify*` methods otherwise. On a scaled output
 the pointer lands in each path's own space: libei's regions in the compositor's logical space, and
