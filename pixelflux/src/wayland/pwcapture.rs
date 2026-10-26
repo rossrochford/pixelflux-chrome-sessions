@@ -46,7 +46,10 @@ const FOURCC_AR24: u32 = 0x3432_5241;
 const FOURCC_XB24: u32 = 0x3432_4258;
 const FOURCC_AB24: u32 = 0x3432_4241;
 const MAX_DAMAGE_REGIONS: u32 = 16;
-const MAX_CURSOR_EDGE: u32 = 256;
+/// The largest cursor sprite edge the cursor meta is asked to hold. A compositor offers that
+/// meta at one fixed size (Mutter 384x384, KWin 256x256), and PipeWire leaves it off the
+/// buffers, with every sprite, unless the size falls inside the range asked for.
+const MAX_CURSOR_EDGE: u32 = 1024;
 
 /// The SPA pixel formats a consumer of BGRA-order pixels takes, best first, with the DRM fourcc
 /// each corresponds to (SPA names byte order, DRM names the little-endian word).
@@ -1189,5 +1192,39 @@ mod tests {
         assert_eq!(shm_code(FOURCC_XR24), 1);
         assert_eq!(shm_code(FOURCC_AR24), 0);
         assert_eq!(shm_code(FOURCC_XB24), FOURCC_XB24);
+    }
+
+    /// The cursor meta's size range takes the fixed sizes compositors offer it at, Mutter's
+    /// 384x384 and KWin's 256x256; PipeWire leaves off a meta whose offered size falls outside.
+    #[test]
+    fn cursor_meta_range_takes_the_compositors_sizes() {
+        let n = Negotiated {
+            width: 1280,
+            height: 720,
+            fourcc: FOURCC_XR24,
+            modifier: None,
+        };
+        let range = negotiated_params(&n, false)
+            .iter()
+            .find_map(|pod| {
+                let (_, _, props) = object_props(pod)?;
+                if find_prop(&props, SPA_PARAM_META_TYPE)?.as_u32()? != SPA_META_CURSOR {
+                    return None;
+                }
+                let size = find_prop(&props, SPA_PARAM_META_SIZE)?;
+                let at =
+                    |off: usize| u32::from_ne_bytes(size.payload[off..off + 4].try_into().unwrap());
+                assert_eq!((size.ty, at(0)), (SPA_TYPE_CHOICE, SPA_CHOICE_RANGE));
+                // Default, minimum, maximum, after the choice and child headers.
+                Some((at(20), at(24)))
+            })
+            .unwrap();
+        for edge in [256, 384] {
+            let size = cursor_meta_size(edge, edge);
+            assert!(
+                range.0 <= size && size <= range.1,
+                "{edge}x{edge} outside {range:?}"
+            );
+        }
     }
 }
