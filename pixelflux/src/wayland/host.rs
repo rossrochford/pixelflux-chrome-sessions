@@ -1143,7 +1143,6 @@ impl HostSession {
                     OutputGeom {
                         pos: state.positions.get(i).copied().unwrap_or((0, 0)),
                         logical: (size.0 / scale, size.1 / scale),
-                        mode: size,
                     }
                 })
                 .collect()
@@ -1707,16 +1706,9 @@ impl HostSession {
         let assignment = assign_streams(&live.session.streams, &self.geoms);
         let stream = &live.session.streams[(*assignment.get(rank)?)?];
         let slot = &slots[rank];
-        let mode = self
-            .geoms
-            .get(rank)
-            .map(|g| g.mode)
-            .filter(|m| m.0 > 0 && m.1 > 0)
-            .unwrap_or(slot.want);
         Some(PortalPoint {
             node: stream.node_id,
             logical: stream_point(slot, stream.size.unwrap_or(slot.want), x, y),
-            pixels: stream_point(slot, mode, x, y),
             position: stream.position,
         })
     }
@@ -1795,7 +1787,7 @@ impl HostSession {
                             .emit(crate::uinput::EV_ABS, crate::uinput::ABS_Y, scale(y, h));
                 }
             } else if let Some(t) = self.portal_target(x, y) {
-                self.with_portal(|p| p.pointer_motion_abs(t.node, t.logical, t.pixels));
+                self.with_portal(|p| p.pointer_motion_abs(t.node, t.logical.0, t.logical.1));
             }
             return;
         };
@@ -2088,15 +2080,13 @@ struct PortalPoint {
     node: u32,
     /// In the stream's logical space, the size the portal announced for it.
     logical: (f64, f64),
-    /// In the stream's pixels, its output's mode.
-    pixels: (f64, f64),
     /// The stream's position in the compositor's logical space, where the portal gave one.
     position: Option<(i32, i32)>,
 }
 
-/// A union-layout point in a space of size `to` over the stream behind `slot`, which captures
-/// its output at physical size `want`: its logical size or its pixels.
-fn stream_point(slot: &LayoutSlot, to: (i32, i32), x: f64, y: f64) -> (f64, f64) {
+/// A union-layout point in the logical space of the stream behind `slot`: the slot captures
+/// its output at physical size `want`, the portal addresses it at logical size `logical`.
+fn stream_point(slot: &LayoutSlot, logical: (i32, i32), x: f64, y: f64) -> (f64, f64) {
     let scale = |v: f64, from: i32, to: i32| {
         let mapped = if from > 0 {
             v * to as f64 / from as f64
@@ -2106,8 +2096,8 @@ fn stream_point(slot: &LayoutSlot, to: (i32, i32), x: f64, y: f64) -> (f64, f64)
         mapped.clamp(0.0, (to.max(1) - 1) as f64)
     };
     (
-        scale(x - slot.pos.0 as f64, slot.want.0, to.0),
-        scale(y - slot.pos.1 as f64, slot.want.1, to.1),
+        scale(x - slot.pos.0 as f64, slot.want.0, logical.0),
+        scale(y - slot.pos.1 as f64, slot.want.1, logical.1),
     )
 }
 
@@ -2137,8 +2127,6 @@ pub(crate) struct OutputGeom {
     pos: (i32, i32),
     /// Mode divided by the integer scale.
     logical: (i32, i32),
-    /// Mode, the output's size in pixels.
-    mode: (i32, i32),
 }
 
 /// Which portal stream backs each output rank: the stream announcing the output's position,
@@ -2357,6 +2345,13 @@ fn portal_thread(ctl: Arc<PortalCtl>) {
                         "portal notify"
                     }
                 );
+                // Mutter divides the spec's logical point by the monitor's scale, and the frontend
+                // refuses one past the logical size, so only the backend can convert it.
+                if ei.is_none() && session.mutter && session.devices & portal::DEVICE_POINTER != 0 {
+                    eprintln!(
+                        "[HostCapture] Mutter takes the portal's absolute pointer motion in the stream's pixels: on a scaled monitor the pointer lands at 1/scale of where it points unless the portal backend converts it, which xdg-desktop-portal-gnome does not."
+                    );
+                }
                 inner.live = Some(Arc::new(PortalLive {
                     session,
                     core,
@@ -3972,9 +3967,9 @@ mod tests {
     }
 
     /// A point on a display captured at an output's mode, scale 2, beside another: the
-    /// stream's logical space (the portal's `size`) holds it at half, its pixels as it is.
+    /// stream's logical space (the portal's `size`) holds it at half, clamped to its edge.
     #[test]
-    fn stream_point_maps_to_logical_size_and_pixels() {
+    fn stream_point_maps_to_logical_size() {
         let slot = LayoutSlot {
             want: (4080, 2304),
             pos: (1920, 0),
@@ -3986,10 +3981,6 @@ mod tests {
         assert_eq!(
             stream_point(&slot, (2040, 1152), 1920.0 + 3000.0, 2000.0),
             (1500.0, 1000.0)
-        );
-        assert_eq!(
-            stream_point(&slot, (4080, 2304), 1920.0 + 3000.0, 2000.0),
-            (3000.0, 2000.0)
         );
         assert_eq!(
             stream_point(&slot, (2040, 1152), 1920.0 + 9000.0, -5.0),

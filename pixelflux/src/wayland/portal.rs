@@ -73,8 +73,9 @@ pub struct PortalSession {
     /// KDE's backend serves the session: it reads a smooth scroll's vertical axis negated.
     kde: bool,
     /// Mutter's remote-desktop service runs on the session bus, which every GNOME backend hands
-    /// input to: it places absolute pointer motion in the stream's pixels (`pointer_motion_abs`).
-    mutter: bool,
+    /// input to: it reads `NotifyPointerMotionAbsolute` in the stream's pixels, which
+    /// xdg-desktop-portal-gnome passes the spec's logical point on as.
+    pub mutter: bool,
     /// Whether dropping the session closes it on the portal: not while `open` still runs it
     /// inside its `zbus::block_on`, which a second one inside would panic on.
     armed: bool,
@@ -474,13 +475,9 @@ impl PortalSession {
         }
     }
 
-    /// Absolute pointer motion over the stream `node`, given as the point in the stream's logical
-    /// space (the `size` it announced) and in its pixels. The spec and KDE's backend take the
-    /// logical point; Mutter takes the pixels, dividing them by the monitor's scale itself where
-    /// its stage views are scaled (`meta_screen_cast_monitor_stream_transform_position`), so a
-    /// session Mutter serves is handed those, whichever backend passes them on.
-    pub fn pointer_motion_abs(&self, node: u32, logical: (f64, f64), pixels: (f64, f64)) {
-        let (x, y) = if self.mutter { pixels } else { logical };
+    /// Absolute pointer motion in the logical coordinate space of the stream `node`, the `size`
+    /// it announced: the portal frontend refuses a point outside that size.
+    pub fn pointer_motion_abs(&self, node: u32, x: f64, y: f64) {
         self.notify(
             "NotifyPointerMotionAbsolute",
             &(self.session.clone(), Options::new(), node, x, y),
