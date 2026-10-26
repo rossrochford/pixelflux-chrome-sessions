@@ -3939,11 +3939,9 @@ fn render_node_tick(
         let mut wm_drawn = false;
         let outcome = host.with_retained(host_idx, |r| {
             let Some(f) = r else { return RETAINED_NONE };
+            // A frame of another size waits for a capture of its size, and a screenshot asked
+            // for meanwhile stays queued for a frame of this one, or until its deadline.
             if (f.width, f.height) != (width, height) {
-                if take_screenshot {
-                    screenshot_result =
-                        Some(Err("Screenshot host frame has stale dimensions".to_string()));
-                }
                 return RETAINED_NONE;
             }
             damage_rects = if have_new {
