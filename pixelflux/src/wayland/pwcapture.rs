@@ -310,6 +310,16 @@ fn negotiated_params(n: &Negotiated, dmabuf: bool) -> Vec<Vec<u8>> {
     ]
 }
 
+/// Whether moving a stream's ask from `cur` to `new` renegotiates (`reconfigure`): anything but
+/// the preferred size does, and that only before a format stands.
+fn renegotiates(cur: &StreamConfig, new: &StreamConfig, negotiated: bool) -> bool {
+    let size_only = StreamConfig {
+        expect: cur.expect,
+        ..new.clone()
+    } == *cur;
+    !size_only || !negotiated
+}
+
 /// A `Meta` param asking for one metadata type of the given size (a plain or ranged Int).
 fn meta(ty: u32, size: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
     object(SPA_TYPE_OBJECT_PARAM_META, SPA_PARAM_META, |p| {
@@ -908,14 +918,22 @@ impl PwStream {
         Ok(this)
     }
 
-    /// Offer a new configuration; unchanged asks cost nothing, a change renegotiates.
+    /// Offer a new configuration; unchanged asks cost nothing, a change renegotiates. A monitor
+    /// stream's size is its monitor's whatever the consumer prefers, so once a format stands, a
+    /// new preferred size alone is kept for later offers without renegotiating: a renegotiation
+    /// drops the buffers in flight, and with them the cursor bitmap KWin sends once per change.
     pub fn reconfigure(&self, cfg: StreamConfig) {
         let pods = {
             let mut cur = self.shared.cfg.lock().unwrap();
             if *cur == cfg {
                 return;
             }
+            let renegotiate =
+                renegotiates(&cur, &cfg, self.shared.negotiated.lock().unwrap().is_some());
             *cur = cfg;
+            if !renegotiate {
+                return;
+            }
             enum_format_pods(&cur)
         };
         self.core.locked(|| unsafe {
@@ -1192,6 +1210,25 @@ mod tests {
         assert_eq!(shm_code(FOURCC_XR24), 1);
         assert_eq!(shm_code(FOURCC_AR24), 0);
         assert_eq!(shm_code(FOURCC_XB24), FOURCC_XB24);
+    }
+
+    /// A new preferred size alone keeps a negotiated format, but renegotiates before one stands;
+    /// a new rate cap or buffer type always renegotiates.
+    #[test]
+    fn a_preferred_size_alone_keeps_a_negotiated_format() {
+        let cur = cfg(false);
+        let resized = StreamConfig {
+            expect: (1280, 720),
+            ..cur.clone()
+        };
+        assert!(!renegotiates(&cur, &resized, true));
+        assert!(renegotiates(&cur, &resized, false));
+        let capped = StreamConfig {
+            fps_milli: 30_000,
+            ..resized.clone()
+        };
+        assert!(renegotiates(&cur, &capped, true));
+        assert!(renegotiates(&cur, &cfg(true), true));
     }
 
     /// The cursor meta's size range takes the fixed sizes compositors offer it at, Mutter's
