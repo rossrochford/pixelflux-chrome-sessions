@@ -1120,10 +1120,9 @@ const WL_CONTENT_HOLD: Duration = Duration::from_millis(500);
 /// real display wall; the fps/scale bounds keep timing math finite and sane.
 const MAX_CAPTURE_DIM: i32 = 16384;
 const MAX_FPS: f64 = 1000.0;
-/// How often frame callbacks go out while nothing is being captured. Fast enough that a
-/// client blocked on one keeps making progress, slow enough that an unwatched session is
-/// not drawing frames nobody asked for.
-const IDLE_FRAME_INTERVAL: Duration = Duration::from_millis(250);
+/// Host-specific private output mode and idle frame-callback rate. Chrome needs
+/// regular callbacks even when no viewer or recorder is attached.
+const POC_REFRESH_MHZ: i32 = 59_963;
 const DEFAULT_FPS: f64 = 60.0;
 
 /// The frame period for a target rate. Settings are sanitized at the Python boundary; a rate
@@ -3449,7 +3448,7 @@ fn render_node_tick(
         send_cursor_frame(state, &output, time);
         let refresh = match node.capture.as_ref() {
             Some(c) => Refresh::Fixed(Duration::from_secs_f64(1.0 / c.settings.target_fps.max(1.0))),
-            None => Refresh::Unknown,
+            None => Refresh::Fixed(frame_period(POC_REFRESH_MHZ as f64 / 1000.0)),
         };
         node.frame_seq += 1;
         feedback.presented(time, refresh, node.frame_seq, wp_presentation_feedback::Kind::Vsync);
@@ -3808,7 +3807,7 @@ fn create_output_on(
             serial_number: format!("{:03}", id + 1),
         },
     );
-    let mode = OutputMode { size: (width, height).into(), refresh: 60_000 };
+    let mode = OutputMode { size: (width, height).into(), refresh: POC_REFRESH_MHZ };
     output.change_current_state(
         Some(mode),
         Some(Transform::Normal),
@@ -4149,7 +4148,7 @@ fn resize_output_on(
         }
     }
     let output = state.output_nodes[idx].output.clone();
-    let refresh = output.current_mode().map(|m| m.refresh).unwrap_or(60_000);
+    let refresh = output.current_mode().map(|m| m.refresh).unwrap_or(POC_REFRESH_MHZ);
     if output.current_mode().map(|m| (m.size.w, m.size.h)) == Some((width, height))
         && (output.current_scale().fractional_scale() - scale).abs() <= 0.001
     {
@@ -4643,6 +4642,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         settings: RustCaptureSettings {
             width,
             height,
+            target_fps: POC_REFRESH_MHZ as f64 / 1000.0,
             ..RustCaptureSettings::default()
         },
         cursor_callback_set: false,
@@ -4709,7 +4709,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
     output.change_current_state(
         Some(OutputMode {
             size: (width, height).into(),
-            refresh: 60_000,
+            refresh: POC_REFRESH_MHZ,
         }),
         Some(Transform::Normal),
         Some(OutputScale::Fractional(1.0)),
@@ -4717,7 +4717,7 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
     );
     output.set_preferred(OutputMode {
         size: (width, height).into(),
-        refresh: 60_000,
+        refresh: POC_REFRESH_MHZ,
     });
     state.space.map_output(&output, (0, 0));
     let global = output.create_global::<AppState>(&dh);
@@ -5575,28 +5575,15 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                 // until a viewer attaches — apps appear frozen whenever nobody is
                 // watching.
                 //
-                // Slowly, though: at a viewing rate the clients draw at a viewing rate
-                // too, and every frame they hand over is one that nothing renders,
-                // encodes or looks at. Unblocking them is the whole purpose here, and
-                // that costs a callback every so often rather than sixty a second.
+                // This POC keeps callbacks at the host display period even while
+                // unwatched, so rAF does not stall for the stock 250 ms idle interval.
                 state.last_idle_service_at = Some(Instant::now());
                 send_idle_frame_callbacks(state);
-                // A parked capture session is an attached consumer that may request a
-                // frame at any moment: tick at frame pace so that request waits at most
-                // one frame, not a quarter second. Input gets the same window: apps
-                // pacing on frame callbacks see their echo promptly after a keypress,
-                // or the idle rate alone turns typing into a 250ms stutter. The wake
-                // handler covers the first keypress landing while the long deadline
-                // is already armed.
-                let post_input = state
-                    .last_input_at
-                    .is_some_and(|t| t.elapsed() < Duration::from_secs(1));
-                let idle = if !state.copy_sessions.is_empty() || post_input {
-                    Duration::from_millis(16)
-                } else {
-                    IDLE_FRAME_INTERVAL
-                };
-                state.frame_idle_long = idle == IDLE_FRAME_INTERVAL;
+                // A parked capture session or fresh input also receives a callback
+                // within one frame period. The no-capture timer never enters the
+                // upstream long-idle state in this experimental build.
+                let idle = frame_period(POC_REFRESH_MHZ as f64 / 1000.0);
+                state.frame_idle_long = false;
                 return TimeoutAction::ToDuration(idle);
             }
             state.frame_idle_long = false;
