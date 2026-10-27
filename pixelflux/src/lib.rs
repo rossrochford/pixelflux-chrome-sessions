@@ -3421,38 +3421,8 @@ fn render_node_tick(
             && (fps > own_fps || (fps == own_fps && n.id < own_id))
     });
     if render_success && drives_screen {
-        let time = state.clock.now();
-        // The composited frame is what the capture consumes, so this render is also the
-        // presentation moment for wp_presentation feedback.
-        let mut feedback = OutputPresentationFeedback::new(&output);
-        for window in state.space.elements_for_output(&output) {
-            window.send_frame(&output, time, Some(Duration::ZERO), |_, _| Some(output.clone()));
-            window.take_presentation_feedback(
-                &mut feedback,
-                |_, _| Some(output.clone()),
-                |_, _| wp_presentation_feedback::Kind::empty(),
-            );
-        }
-        // Panels, backgrounds and other layer-shell surfaces are composited from the
-        // layer map rather than the space, so they need the callback separately: one
-        // that never arrives leaves a client which draws on frame callbacks showing
-        // whatever it painted first, for as long as the session lasts.
-        for layer in layer_map_for_output(&output).layers() {
-            layer.send_frame(&output, time, Some(Duration::ZERO), |_, _| Some(output.clone()));
-            layer.take_presentation_feedback(
-                &mut feedback,
-                |_, _| Some(output.clone()),
-                |_, _| wp_presentation_feedback::Kind::empty(),
-            );
-        }
-        send_cursor_frame(state, &output, time);
-        let refresh = match node.capture.as_ref() {
-            Some(c) => Refresh::Fixed(Duration::from_secs_f64(1.0 / c.settings.target_fps.max(1.0))),
-            None => Refresh::Fixed(frame_period(POC_REFRESH_MHZ as f64 / 1000.0)),
-        };
-        node.frame_seq += 1;
-        feedback.presented(time, refresh, node.frame_seq, wp_presentation_feedback::Kind::Vsync);
-
+        // Capture sampling does not present to a physical output. Client callbacks
+        // and discarded presentation feedback belong to the output timer.
         // Host mode renders nothing locally, so there is no composited buffer to
         // serve capture clients from; their frames stay parked.
         if !host_mode {
@@ -4789,12 +4759,10 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         had_input
     }
 
-    /// One idle-tick service pass for committed clients while nothing captures:
+    /// Service committed clients independently of capture sampling:
     /// frame callbacks unblock vsynced clients, requested presentation feedback
     /// is discarded (nothing presents), and the renderer's import cache is
-    /// pruned since no render will do it. Shared by the frame timer's idle
-    /// branch and the input wake handler, which must not let a fresh keypress
-    /// wait out an already-armed long idle deadline.
+    /// pruned even when there is no capture consumer.
     fn send_idle_frame_callbacks(state: &mut AppState) {
         let time = state.clock.now();
         for node in state.output_nodes.iter().filter(|n| n.owner.is_none()) {
@@ -5432,21 +5400,6 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
         .handle()
         .insert_source(wake_rx, |_, _, state| {
             let had_input = drain_thread_commands(state);
-            // Input landing while the frame timer sits on its long idle
-            // deadline must not wait it out: service the frame callbacks now
-            // (at most at frame pace) so the app's echo repaint starts with
-            // the keypress; the timer's own next fire re-arms the short pace.
-            if state.frame_idle_long
-                && state
-                    .last_input_at
-                    .is_some_and(|t| t.elapsed() < Duration::from_millis(50))
-                && state
-                    .last_idle_service_at
-                    .is_none_or(|t| t.elapsed() >= Duration::from_millis(16))
-            {
-                state.last_idle_service_at = Some(Instant::now());
-                send_idle_frame_callbacks(state);
-            }
             // Input may pull a capture's due frame forward to its own phase (see
             // FramePace). Not under host capture: a pull there would re-encode the frame
             // the host already delivered, so the host's own frames wake the render instead.
@@ -5508,6 +5461,14 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
             }
         })
         .expect("Failed to init wayland socket source");
+
+    event_loop
+        .handle()
+        .insert_source(Timer::immediate(), |_, _, state| {
+            send_idle_frame_callbacks(state);
+            TimeoutAction::ToDuration(frame_period(POC_REFRESH_MHZ as f64 / 1000.0))
+        })
+        .expect("Failed to init output callback timer");
 
     let timer = Timer::immediate();
     event_loop
@@ -5578,7 +5539,6 @@ fn run_wayland_thread(cfg: WaylandThreadConfig) {
                 // This POC keeps callbacks at the host display period even while
                 // unwatched, so rAF does not stall for the stock 250 ms idle interval.
                 state.last_idle_service_at = Some(Instant::now());
-                send_idle_frame_callbacks(state);
                 // A parked capture session or fresh input also receives a callback
                 // within one frame period. The no-capture timer never enters the
                 // upstream long-idle state in this experimental build.
