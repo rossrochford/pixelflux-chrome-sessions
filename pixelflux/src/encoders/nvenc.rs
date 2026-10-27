@@ -935,6 +935,21 @@ fn fill_band_map(
     first
 }
 
+/// Hand `pic` the QP delta map `map` at API `api`. Below 12.0 the codec union runs eight bytes
+/// shorter and the driver reads the map's pointer and size where the pinned layout keeps
+/// `reserved5`.
+fn point_at_qp_map(pic: &mut NV_ENC_PIC_PARAMS, map: &mut [i8], api: (u32, u32)) {
+    if api < (12, 0) {
+        pic.reserved5 = [
+            map.as_mut_ptr().cast(),
+            ptr::without_provenance_mut(map.len()),
+        ];
+    } else {
+        pic.qpDeltaMap = map.as_mut_ptr();
+        pic.qpDeltaMapSize = map.len() as u32;
+    }
+}
+
 /// The driver's message for the last failure on `session`, or a stand-in when it has none: NVENC
 /// clears the string once a session is torn down, so it is only meaningful read straight after
 /// the call that failed.
@@ -3908,8 +3923,7 @@ impl NvencEncoder {
                     );
                     let held = self.hold_rate(rest, Some(first));
                     if held.is_some() {
-                        pic_params.qpDeltaMap = self.qp_map.as_mut_ptr();
-                        pic_params.qpDeltaMapSize = self.qp_map.len() as u32;
+                        point_at_qp_map(&mut pic_params, &mut self.qp_map, nvenc_cur_ver());
                     }
                     held
                 }
@@ -3980,7 +3994,7 @@ impl NvencEncoder {
                         (from, end),
                         q as i32 - rest as i32,
                     );
-                    pic_params.qpDeltaMap = self.qp_map.as_mut_ptr();
+                    point_at_qp_map(&mut pic_params, &mut self.qp_map, nvenc_cur_ver());
                     Some(end)
                 }
                 (None, _, None) => {
@@ -9633,6 +9647,36 @@ mod version_tests {
                 if at == 1816 { (0, 3) } else { (3, 0) },
                 "{maj}.{min}"
             );
+        }
+    }
+
+    /// A QP delta map's pointer and size land where each version's own header puts them: at
+    /// 1696 and 1704 below 12.0, and at 1712 and 1720 from it.
+    #[test]
+    fn qp_map_sits_where_each_version_reads_it() {
+        let mut map = vec![0i8; 40];
+        for (maj, min, at) in [
+            (10, 0, 1696),
+            (11, 0, 1696),
+            (11, 1, 1696),
+            (12, 0, 1712),
+            (12, 1, 1712),
+            (12, 2, 1712),
+            (13, 0, 1712),
+        ] {
+            let mut pic = NV_ENC_PIC_PARAMS::default();
+            point_at_qp_map(&mut pic, &mut map, (maj, min));
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    (&pic as *const NV_ENC_PIC_PARAMS).cast::<u8>(),
+                    std::mem::size_of_val(&pic),
+                )
+            };
+            let word = |at: usize| u64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap());
+            let other = if at == 1696 { 1712 } else { 1696 };
+            assert_eq!(word(at), map.as_ptr() as u64, "{maj}.{min}");
+            assert_eq!(word(at + 8) as u32, 40, "{maj}.{min}");
+            assert_eq!((word(other), word(other + 8)), (0, 0), "{maj}.{min}");
         }
     }
 
