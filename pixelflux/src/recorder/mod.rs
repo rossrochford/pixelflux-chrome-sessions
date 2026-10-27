@@ -515,6 +515,28 @@ fn own_capture_settings(opts: &RecordOptions) -> Result<RustCaptureSettings, Str
     Ok(s)
 }
 
+/// Owns the early-started audio reader until `start` succeeds; on an error return it stops and joins it.
+struct AudioStartGuard {
+    stop: Arc<AtomicBool>,
+    cfg: Option<mp4::AudioTrackConfig>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl AudioStartGuard {
+    fn disarm(&mut self) -> (Option<mp4::AudioTrackConfig>, Option<thread::JoinHandle<()>>) {
+        (self.cfg.take(), self.join.take())
+    }
+}
+
+impl Drop for AudioStartGuard {
+    fn drop(&mut self) {
+        if let Some(join) = self.join.take() {
+            self.stop.store(true, Ordering::Relaxed);
+            let _ = join.join();
+        }
+    }
+}
+
 /// Start a recording. Exactly one may be active per process; returns the initial status.
 pub fn start(opts: RecordOptions) -> Result<RecordingStatus, String> {
     let mut guard = ACTIVE.lock().unwrap();
@@ -567,6 +589,24 @@ pub fn start(opts: RecordOptions) -> Result<RecordingStatus, String> {
             }
         }
     };
+
+    // Start reading audio as soon as the socket is connected. The audio clock is anchored at the
+    // first packet's arrival; spawning the reader only after capture setup (which can take a few
+    // hundred milliseconds) let packets queue in the socket and anchored a stale packet at the late
+    // read, shifting the whole audio track later by the setup time. The writer already buffers audio
+    // that arrives before its init segment (`early_audio`). The guard stops the reader if setup fails.
+    let audio_stop = Arc::new(AtomicBool::new(false));
+    let mut audio_guard = AudioStartGuard { stop: audio_stop.clone(), cfg: None, join: None };
+    if let Some((reader, head)) = audio_source {
+        audio_guard.cfg = Some(mp4::AudioTrackConfig { sample_entry: mp4::opus_sample_entry(&head) });
+        let (tx, shared, stop) = (tx.clone(), shared.clone(), audio_stop.clone());
+        audio_guard.join = Some(
+            thread::Builder::new()
+                .name("pf-recorder-audio".to_string())
+                .spawn(move || audio_thread(reader, tx, shared, stop))
+                .map_err(|e| format!("failed to spawn recorder audio thread: {e}"))?,
+        );
+    }
 
     let (mode, mode_name, backend_name) = match backend {
         PreferredBackend::Wayland => {
@@ -673,19 +713,7 @@ pub fn start(opts: RecordOptions) -> Result<RecordingStatus, String> {
         }
     };
 
-    let audio_stop = Arc::new(AtomicBool::new(false));
-    let (audio_cfg, audio) = match audio_source {
-        Some((reader, head)) => {
-            let cfg = mp4::AudioTrackConfig { sample_entry: mp4::opus_sample_entry(&head) };
-            let (tx, shared, stop) = (tx.clone(), shared.clone(), audio_stop.clone());
-            let join = thread::Builder::new()
-                .name("pf-recorder-audio".to_string())
-                .spawn(move || audio_thread(reader, tx, shared, stop))
-                .map_err(|e| format!("failed to spawn recorder audio thread: {e}"))?;
-            (Some(cfg), Some(join))
-        }
-        None => (None, None),
-    };
+    let (audio_cfg, audio) = audio_guard.disarm();
     let writer = {
         let shared = shared.clone();
         let path = opts.path.clone();
@@ -881,4 +909,46 @@ pub fn status_to_json(s: &RecordingStatus) -> serde_json::Value {
         "height": s.height,
         "error": s.error,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A reader that runs until told to stop, then records that it exited.
+    fn reader(stop: Arc<AtomicBool>, exited: Arc<AtomicBool>) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(5));
+            }
+            exited.store(true, Ordering::Relaxed);
+        })
+    }
+
+    /// An error return drops the armed guard: the early audio reader is stopped and joined
+    /// before `start` returns, so no reader outlives a failed start.
+    #[test]
+    fn armed_guard_stops_and_joins_reader_on_drop() {
+        let (stop, exited) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let guard = AudioStartGuard { stop: stop.clone(), cfg: None, join: Some(reader(stop.clone(), exited.clone())) };
+        drop(guard);
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(exited.load(Ordering::Relaxed), "drop must join the reader, not just signal it");
+    }
+
+    /// On success `start` disarms the guard and takes the reader; dropping it then leaves the
+    /// reader running for the recording.
+    #[test]
+    fn disarmed_guard_leaves_reader_running() {
+        let (stop, exited) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicBool::new(false)));
+        let mut guard = AudioStartGuard { stop: stop.clone(), cfg: None, join: Some(reader(stop.clone(), exited.clone())) };
+        let (_, join) = guard.disarm();
+        drop(guard);
+        thread::sleep(Duration::from_millis(30));
+        assert!(!stop.load(Ordering::Relaxed));
+        assert!(!exited.load(Ordering::Relaxed));
+        stop.store(true, Ordering::Relaxed);
+        join.unwrap().join().unwrap();
+        assert!(exited.load(Ordering::Relaxed));
+    }
 }
