@@ -1079,25 +1079,62 @@ fn session_refusal(status: NVENCSTATUS) -> String {
     }
 }
 
-/// Whether a session of `codec` codes 10 bits: HEVC and AV1 where the device reports it, from
-/// the API that names a session's input and output depths (12.2). The session converts its
-/// 8-bit RGB to 10-bit samples itself (`ConvertLayout`). H.264 stays 8-bit, which only the
-/// newest engines code at 10.
+/// Whether a session of `codec` codes 10 bits: HEVC and AV1 where the device reports it, at
+/// whichever API the session negotiated (`set_bit_depth`). The session converts its 8-bit RGB to
+/// 10-bit samples itself (`ConvertLayout`). H.264 stays 8-bit, which only the newest engines code
+/// at 10.
 unsafe fn codes_ten_bit(
     function_list: &NV_ENCODE_API_FUNCTION_LIST,
     session: *mut c_void,
     codec: Codec,
     guid: GUID,
 ) -> bool {
-    let (major, minor) = nvenc_cur_ver();
     matches!(codec, Codec::H265 | Codec::Av1)
-        && (major << 4) | minor >= 0xC2
         && query_cap(
             function_list,
             session,
             guid,
             NV_ENC_CAPS::NV_ENC_CAPS_SUPPORT_10BIT_ENCODE,
         ) == Some(1)
+}
+
+/// Stamp an HEVC or AV1 `config` with `bit_depth` as API `api` reads it. From 12.2 the session
+/// names its input and output depths; before it HEVC carries the output's minus eight in the
+/// bitfield the pinned layout keeps as `reserved3`, its input following the buffer format, and
+/// AV1 (12.0 and 12.1) the input's and the output's in the bits 13.0 gave its LTR, SVC and HDR
+/// flags. The offsets count from the codec config's first bitfield, at byte 16.
+fn set_bit_depth(config: &mut NV_ENC_CONFIG, codec: Codec, bit_depth: u32, api: (u32, u32)) {
+    let depth = if bit_depth > 8 {
+        NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_10
+    } else {
+        NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_8
+    };
+    let minus8 = u64::from(bit_depth.saturating_sub(8));
+    unsafe {
+        match codec {
+            Codec::H265 if api >= (12, 2) => {
+                let c = &mut config.encodeCodecConfig.hevcConfig;
+                c.inputBitDepth = depth;
+                c.outputBitDepth = depth;
+            }
+            Codec::H265 => config
+                .encodeCodecConfig
+                .hevcConfig
+                ._bitfield_1
+                .set(11, 3, minus8),
+            Codec::Av1 if api >= (12, 2) => {
+                let c = &mut config.encodeCodecConfig.av1Config;
+                c.inputBitDepth = depth;
+                c.outputBitDepth = depth;
+            }
+            Codec::Av1 => {
+                let bits = &mut config.encodeCodecConfig.av1Config._bitfield_1;
+                bits.set(12, 3, minus8);
+                bits.set(15, 3, minus8);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Open a bare NVENC session on a current CUDA context, list the codecs its device encodes
@@ -2925,11 +2962,6 @@ impl NvencEncoder {
         anchors: usize,
         tuning: &NvencTuning,
     ) {
-        let depth = if bit_depth > 8 {
-            NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_10
-        } else {
-            NV_ENC_BIT_DEPTH::NV_ENC_BIT_DEPTH_8
-        };
         let primaries = NV_ENC_VUI_COLOR_PRIMARIES::NV_ENC_VUI_COLOR_PRIMARIES_BT709;
         let transfer = NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
         let matrix = NV_ENC_VUI_MATRIX_COEFFS::NV_ENC_VUI_MATRIX_COEFFS_BT709;
@@ -2963,8 +2995,6 @@ impl NvencEncoder {
                         tuning.slices.map_or((0, 0), |n| (SLICE_MODE_COUNT, n));
                     c.idrPeriod = 0xFFFFFFFF;
                     c.set_chromaFormatIDC(if fullcolor { 3 } else { 1 });
-                    c.inputBitDepth = depth;
-                    c.outputBitDepth = depth;
                     c.set_repeatSPSPPS(1);
                     c.set_outputAUD(0);
                     vui(&mut c.hevcVUIParameters);
@@ -2975,8 +3005,6 @@ impl NvencEncoder {
                     c.tier = 0;
                     c.idrPeriod = 0xFFFFFFFF;
                     c.set_chromaFormatIDC(1);
-                    c.inputBitDepth = depth;
-                    c.outputBitDepth = depth;
                     c.maxNumRefFramesInDPB = dpb;
                     if anchors > 0 {
                         c.set_enableLTR(1);
@@ -3014,6 +3042,7 @@ impl NvencEncoder {
                 }
             }
         }
+        set_bit_depth(config, codec, bit_depth, nvenc_cur_ver());
     }
 
     /// The level the live config declares, read from its codec arm.
@@ -9759,6 +9788,45 @@ mod version_tests {
             assert_eq!(word(at), map.as_ptr() as u64, "{maj}.{min}");
             assert_eq!(word(at + 8) as u32, 40, "{maj}.{min}");
             assert_eq!((word(other), word(other + 8)), (0, 0), "{maj}.{min}");
+        }
+    }
+
+    /// A 10-bit HEVC or AV1 config carries its depth where each version's own header puts it: at
+    /// 12.2 and 13.0 as the input and output depth fields (10 at 200 and 204 for HEVC, 112 and
+    /// 116 for AV1), before it as the depth minus eight in the bitfield at byte 17 (HEVC's
+    /// `pixelBitDepthMinus8` at bits 3-5, AV1's input and output at 4-6 and 7-9), leaving the
+    /// depth fields clear.
+    #[test]
+    fn bit_depth_sits_where_each_version_reads_it() {
+        let word = |c: &NV_ENC_CONFIG, at: usize| {
+            let bytes = unsafe {
+                std::slice::from_raw_parts((c as *const NV_ENC_CONFIG).cast::<u8>(), 3584)
+            };
+            let at = 168 + at;
+            u32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap())
+        };
+        for (codec, depths, bits) in [
+            (Codec::H265, (200, 204), 2 << 11),
+            (Codec::Av1, (112, 116), 2 << 12 | 2 << 15),
+        ] {
+            for (maj, min) in [(10, 0), (11, 1), (12, 0), (12, 1), (12, 2), (13, 0)] {
+                if codec == Codec::Av1 && maj < 12 {
+                    continue;
+                }
+                let mut c = NV_ENC_CONFIG::default();
+                set_bit_depth(&mut c, codec, 10, (maj, min));
+                let named = (maj, min) >= (12, 2);
+                assert_eq!(
+                    (word(&c, depths.0), word(&c, depths.1)),
+                    if named { (10, 10) } else { (0, 0) },
+                    "{codec:?} {maj}.{min}"
+                );
+                assert_eq!(
+                    word(&c, 16),
+                    if named { 0 } else { bits },
+                    "{codec:?} {maj}.{min}"
+                );
+            }
         }
     }
 
