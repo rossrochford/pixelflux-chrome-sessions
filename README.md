@@ -722,8 +722,9 @@ so no frame is converted on a CPU core.
     in-process to the GPU you selected (no separate `LD_PRELOAD` shim is required). Verified on
     NVIDIA drivers 570–595.
 *   **4:4:4 (High 4:4:4):** Set `video_fullcolor = True` to encode full-chroma H.264 via NVENC
-    (`video_fullcolor` codec), in addition to the software path. See
-    [VA-API 4:4:4](#va-api-444) for how the same request is resolved on VA-API.
+    (`video_fullcolor` codec), in addition to the software path. A GPU whose NVENC has no 4:4:4
+    (Kepler) hands the request to the software path, as VA-API does; see
+    [VA-API 4:4:4](#va-api-444) for how the same request is resolved there.
 *   **Force a keyframe on demand:** `capture.request_idr_frame()` forces an IDR frame, e.g. when
     a client reconnects or its decoder is reset. It routes to whichever encoder is active
     (NVENC, VA-API, or software) and is a no-op while no capture is running.

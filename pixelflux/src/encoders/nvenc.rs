@@ -2378,6 +2378,16 @@ impl NvencEncoder {
                     "NVENC maximum encode size {mw}x{mh} exceeded by {width}x{height}; using software"
                 ));
             }
+            if caps.downgraded_color && super::software_fullcolor(codec) {
+                (function_list.nvEncDestroyEncoder.unwrap())(encoder_session);
+                (cuda.cuMemFree_v2)(input_device_ptr);
+                (cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
+                return Err(format!(
+                    "this GPU's NVENC engine encodes no {} 4:4:4, which the software encoder does",
+                    codec.display()
+                ));
+            }
             if caps.downgraded_color {
                 eprintln!(
                     "[NVENC] {} 4:4:4 (YUV444) encoding unsupported on this GPU; encoding 4:2:0.",
@@ -5192,7 +5202,7 @@ mod gpu_tests {
     }
 
     /// Test helper: `host_session`, or `None` where the device has no engine for the codec (AV1
-    /// before Ada, HEVC on Kepler), which the caller skips.
+    /// before Ada, HEVC on Kepler) or for its 4:4:4 (Kepler), which the caller skips.
     fn codec_session(s: &RustCaptureSettings) -> Option<NvencEncoder> {
         match host_session(s) {
             Ok(enc) => Some(enc),
@@ -5608,7 +5618,9 @@ mod gpu_tests {
 
             let mut full = s.clone();
             full.video_fullcolor = true;
-            let enc = host_session(&full).expect("4:4:4 request");
+            let Some(enc) = codec_session(&full) else {
+                continue;
+            };
             if codec.fullcolor() {
                 println!("{codec:?} 4:4:4: {}", enc.is_fullcolor());
             } else {
@@ -5632,7 +5644,9 @@ mod gpu_tests {
                 s.codec = codec;
                 s.video_fullcolor = fullcolor;
                 s.video_bit_depth = 10;
-                let mut enc = host_session(&s).expect("session");
+                let Some(mut enc) = codec_session(&s) else {
+                    continue;
+                };
                 let carried = formats.ten_bit[(fullcolor && formats.fullcolor) as usize];
                 println!("{codec:?} 4:4:4 {fullcolor}: {}-bit", enc.bit_depth());
                 assert_eq!(enc.bit_depth(), if carried { 10 } else { 8 }, "{codec:?}");
@@ -8007,7 +8021,9 @@ mod gpu_tests {
         for fullcolor in [false, true] {
             let mut s = settings(1280, 720, 60.0);
             s.video_fullcolor = fullcolor;
-            let enc = host_session(&s).expect("NVENC init");
+            let Some(enc) = codec_session(&s) else {
+                continue;
+            };
             // encodeCodecConfig is a union; a successful init leaves the H.264 arm live.
             let h264 = unsafe { &enc.encode_config.encodeCodecConfig.h264Config };
             let vui = &h264.h264VUIParameters;
@@ -8163,8 +8179,9 @@ mod gpu_tests {
             video_fullcolor: true,
             ..st
         };
-        let enc444 = host_session(&full).expect("NVENC init");
-        if enc444.is_fullcolor() {
+        if let Some(enc444) = codec_session(&full)
+            && enc444.is_fullcolor()
+        {
             assert!(
                 enc444.csc.is_none(),
                 "a 4:4:4 session has no chroma to site and takes no convert"
@@ -8986,7 +9003,14 @@ mod gpu_tests {
             s.video_bit_depth = 10;
             let mut streams = Vec::new();
             for direct in [true, false] {
-                let mut enc = NvencEncoder::new(&s, egl_display).expect("NVENC init");
+                let mut enc = match NvencEncoder::new(&s, egl_display) {
+                    Ok(enc) => enc,
+                    Err(e) if e.contains("engine") => {
+                        println!("{e}");
+                        return;
+                    }
+                    Err(e) => panic!("NVENC init: {e}"),
+                };
                 if enc.bit_depth() != 10 {
                     println!("this device codes no 10-bit HEVC");
                     return;
