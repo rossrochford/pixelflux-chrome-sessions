@@ -5191,6 +5191,19 @@ mod gpu_tests {
         })
     }
 
+    /// Test helper: `host_session`, or `None` where the device has no engine for the codec (AV1
+    /// before Ada, HEVC on Kepler), which the caller skips.
+    fn codec_session(s: &RustCaptureSettings) -> Option<NvencEncoder> {
+        match host_session(s) {
+            Ok(enc) => Some(enc),
+            Err(e) if e.contains("engine") => {
+                println!("{:?}: {e}", s.codec);
+                None
+            }
+            Err(e) => panic!("{:?} NVENC init: {e}", s.codec),
+        }
+    }
+
     /// Test helper: a `w×h` BGRA frame filled with a hashed gradient (offset by `seed`) so
     /// the content has structure and encodes are non-trivial.
     fn frame(w: usize, h: usize, seed: u8) -> Vec<u8> {
@@ -7047,7 +7060,9 @@ mod gpu_tests {
             s.codec = codec;
             s.video_cbr_mode = true;
             s.video_bitrate_kbps = 8000;
-            let mut enc = host_session(&s).expect("NVENC init");
+            let Some(mut enc) = codec_session(&s) else {
+                continue;
+            };
             let level = enc.declared_level();
             let frames: Vec<Vec<u8>> = (0..16).map(|i| moving_frame(1920, 1080, i)).collect();
             let kbit = |enc: &mut NvencEncoder, range: std::ops::Range<u64>| {
@@ -7099,7 +7114,7 @@ mod gpu_tests {
                 s.video_bitrate_kbps = 8000;
                 let mut enc = match host_session(&s) {
                     Ok(enc) => enc,
-                    Err(e) if codec == Codec::Av1 && e.contains("engine") => {
+                    Err(e) if e.contains("engine") => {
                         println!("{codec:?}: {e}");
                         break;
                     }
@@ -7239,7 +7254,9 @@ mod gpu_tests {
             for codec in [Codec::H264, Codec::H265] {
                 let mut s = settings(w as i32, h as i32, 60.0);
                 s.codec = codec;
-                let mut enc = host_session(&s).expect("NVENC init");
+                let Some(mut enc) = codec_session(&s) else {
+                    continue;
+                };
                 for i in 0..4u64 {
                     let pkt = enc
                         .encode_cpu_argb(&frame(w, h, 20 + i as u8), w * 4, i, 25, i == 0)
@@ -7365,7 +7382,9 @@ mod gpu_tests {
         let mut s = settings(w as i32, h as i32, 60.0);
         s.codec = Codec::H265;
         s.omit_stripe_headers = true;
-        let mut enc = host_session(&s).expect("NVENC init");
+        let Some(mut enc) = codec_session(&s) else {
+            return;
+        };
         let still = frame(w, h, 40);
         let mut frames = Vec::new();
         let mut encode = |enc: &mut NvencEncoder, i: u64| {
@@ -7683,6 +7702,10 @@ mod gpu_tests {
                     s.video_bitrate_kbps, c.level,
                 );
             },
+            Err(e) if e.contains("engine") => {
+                println!("H265: {e}");
+                return;
+            }
             Err(e) => panic!("High tier must open above the Main-tier ceiling: {e}"),
         }
         drop(high);
@@ -8002,7 +8025,7 @@ mod gpu_tests {
                 NV_ENC_VUI_TRANSFER_CHARACTERISTIC::NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709 as u32
             );
             assert_eq!(vui.videoFullRangeFlag, 0, "fullcolor={fullcolor}");
-            assert_eq!(h264.chromaFormatIDC, if fullcolor { 3 } else { 1 });
+            assert_eq!(h264.chromaFormatIDC, if enc.is_fullcolor() { 3 } else { 1 });
         }
     }
 
@@ -8017,7 +8040,9 @@ mod gpu_tests {
         use crate::webcam::decode::{Codec, Decoder as _, VideoDecoder};
         let (w, h) = (256u32, 256u32);
         let s = settings(w as i32, h as i32, 60.0);
-        let (gbm, mut renderer) = gpu_render();
+        let Some((gbm, mut renderer)) = gpu_render() else {
+            return;
+        };
         let egl_display = renderer.egl_context().display().get_display_handle().handle;
         let (_bo, dmabuf) = column_dmabuf(&gbm, &mut renderer, w, h);
         let mut enc = NvencEncoder::new(&s, egl_display).expect("NVENC init");
@@ -8172,7 +8197,9 @@ mod gpu_tests {
                 video_fullcolor: fullcolor,
                 ..settings(w as i32, h as i32, 60.0)
             };
-            let mut enc = host_session(&st).expect("NVENC init");
+            let Some(mut enc) = codec_session(&st) else {
+                continue;
+            };
             if fullcolor && !enc.is_fullcolor() {
                 println!("[chart] this GPU carries no 4:4:4 {codec:?}");
                 continue;
@@ -8690,16 +8717,29 @@ mod gpu_tests {
 
     /// Test helper: the raw GBM device and GLES renderer of the render node named by
     /// `PIXELFLUX_TEST_RENDER_NODE`, else the NVIDIA GPU's, brought up exactly as the compositor
-    /// brings them up.
-    fn gpu_render() -> (
+    /// brings them up, or `None` where GBM allocates nothing there, as `probe_wayland_gpu`
+    /// finds (NVIDIA's GBM backend arrived in driver 495), which the caller skips.
+    fn gpu_render() -> Option<(
         gbm::Device<std::fs::File>,
         smithay::backend::renderer::gles::GlesRenderer,
-    ) {
+    )> {
         let node = std::env::var("PIXELFLUX_TEST_RENDER_NODE")
             .ok()
             .or_else(|| crate::auto_select_render_node(Some("nvidia")))
             .expect("no NVIDIA render node");
-        crate::gpu_render_init(std::path::Path::new(&node)).expect("GPU render init")
+        let (gbm, renderer) =
+            crate::gpu_render_init(std::path::Path::new(&node)).expect("GPU render init");
+        let bo = gbm.create_buffer_object::<()>(
+            64,
+            64,
+            gbm::Format::Argb8888,
+            gbm::BufferObjectFlags::RENDERING,
+        );
+        if let Err(e) = bo {
+            println!("{node}: GBM allocates nothing ({e})");
+            return None;
+        }
+        Some((gbm, renderer))
     }
 
     /// Background and block colors painted into test dmabufs, as `Color32F` components.
@@ -8849,7 +8889,9 @@ mod gpu_tests {
         use crate::webcam::decode::{Codec, VideoDecoder};
         let (w, h) = (1920u32, 1080u32);
         let s = settings(w as i32, h as i32, 60.0);
-        let (gbm, mut renderer) = gpu_render();
+        let Some((gbm, mut renderer)) = gpu_render() else {
+            return;
+        };
         let egl_display = renderer.egl_context().display().get_display_handle().handle;
         let bufs: Vec<_> = (1..=2u32)
             .map(|seed| (seed, painted_dmabuf(&gbm, &mut renderer, w, h, seed)))
@@ -8930,7 +8972,9 @@ mod gpu_tests {
     #[ignore]
     fn gpu_dmabuf_ten_bit_arms_agree() {
         let (w, h) = (1920u32, 1080u32);
-        let (gbm, mut renderer) = gpu_render();
+        let Some((gbm, mut renderer)) = gpu_render() else {
+            return;
+        };
         let egl_display = renderer.egl_context().display().get_display_handle().handle;
         let bufs: Vec<_> = (1..=2u32)
             .map(|seed| painted_dmabuf(&gbm, &mut renderer, w, h, seed))
@@ -9332,7 +9376,9 @@ mod gpu_tests {
             .and_then(|v| v.parse().ok())
             .unwrap_or(300);
         let s = settings(w as i32, h as i32, 60.0);
-        let (gbm, mut renderer) = gpu_render();
+        let Some((gbm, mut renderer)) = gpu_render() else {
+            return;
+        };
         let egl_display = renderer.egl_context().display().get_display_handle().handle;
         let bufs: Vec<_> = (1..=2u32)
             .map(|seed| painted_dmabuf(&gbm, &mut renderer, w, h, seed).1)
