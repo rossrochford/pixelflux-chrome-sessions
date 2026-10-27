@@ -1698,6 +1698,10 @@ pub struct NvencEncoder {
     fullcolor: bool,
     /// The bits per sample the session codes.
     bit_depth: u32,
+    /// Whether the session was opened asking for 4:4:4 and for 10 bits, which a device without
+    /// them codes at 4:2:0 and 8: a resize keeps the session for that ask or for what it codes,
+    /// either of which opens the same session again.
+    asked: (bool, bool),
     width: u32,
     height: u32,
     current_qp: u32,
@@ -2783,6 +2787,10 @@ impl NvencEncoder {
                 codec,
                 fullcolor: is_444,
                 bit_depth,
+                asked: (
+                    settings.video_fullcolor && codec.fullcolor(),
+                    settings.video_bit_depth >= 10,
+                ),
                 width,
                 height,
                 current_qp: codec.hardware_quantizer(Hardware::Nvenc, settings.video_crf),
@@ -3160,9 +3168,10 @@ impl NvencEncoder {
     /// The NVENC session, CUDA context, and bitstream buffers survive, so a restart costs a few
     /// milliseconds instead of a full rebuild. Flow:
     ///
-    /// 1. **Reject the unchangeable**: a different encode device or codec, a chroma-format flip
-    ///    (4:4:4), an RC-mode flip, or dimensions of zero or beyond the init-time `maxEncode`
-    ///    headroom all return `Err` so the caller rebuilds.
+    /// 1. **Reject the unchangeable**: a different encode device or codec, a flip of the chroma
+    ///    format or depth asked for (4:4:4, 10-bit; not of what a device without them codes), an
+    ///    RC-mode flip, or dimensions of zero or beyond the init-time `maxEncode` headroom all
+    ///    return `Err` so the caller rebuilds.
     /// 2. **Keep the stream at unchanged dimensions**: the reference chain, the input surface, and
     ///    the dmabuf imports stay as they are, so the restart costs no IDR and no reset. Only the
     ///    pinned hosts are dropped -- the restart recreates the source buffers, often at the same
@@ -3197,10 +3206,13 @@ impl NvencEncoder {
         if settings.codec != self.codec {
             return Err("codec changed".into());
         }
-        if (settings.video_fullcolor && self.codec.fullcolor()) != self.fullcolor {
+        let fullcolor = settings.video_fullcolor && self.codec.fullcolor();
+        if fullcolor != self.asked.0 && fullcolor != self.fullcolor {
             return Err("chroma format changed".into());
         }
-        if (settings.video_bit_depth >= 10) != (self.bit_depth > 8)
+        let ten_bit = settings.video_bit_depth >= 10;
+        if ten_bit != self.asked.1
+            && ten_bit != (self.bit_depth > 8)
             && matches!(self.codec, Codec::H265 | Codec::Av1)
         {
             return Err("bit depth changed".into());
