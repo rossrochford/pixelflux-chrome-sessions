@@ -3181,7 +3181,7 @@ fn render_node_tick(
                         }
 
                         for window in state.space.elements_for_output(&output).rev() {
-                            let window_loc = state.space.element_location(window).unwrap_or_default() - origin;
+                            let window_loc = state.space.element_location(window).unwrap_or_default() - window.geometry().loc - origin;
 
                             if let Some(surface) = window.wl_surface() {
                                 let popups = PopupManager::popups_for_surface(&surface);
@@ -3345,7 +3345,7 @@ fn render_node_tick(
                             }
 
                             for window in state.space.elements_for_output(&output).rev() {
-                                let loc = state.space.element_location(window).unwrap_or_default() - origin;
+                                let loc = state.space.element_location(window).unwrap_or_default() - window.geometry().loc - origin;
 
                                 if let Some(surface) = window.wl_surface() {
                                     let popups = PopupManager::popups_for_surface(&surface);
