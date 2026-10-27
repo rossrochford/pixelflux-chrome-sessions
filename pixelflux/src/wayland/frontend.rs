@@ -702,6 +702,32 @@ impl PrimarySelectionHandler for AppState {
     }
 }
 
+pub(crate) fn poc_window_size() -> Option<(i32, i32)> {
+    static SIZE: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        let raw = std::env::var("PIXELFLUX_POC_WINDOW_SIZE").ok()?;
+        let (w, h) = raw.split_once('x')?;
+        let size = (w.parse::<i32>().ok()?, h.parse::<i32>().ok()?);
+        (size.0 > 0 && size.1 > 0).then_some(size)
+    })
+}
+
+pub(crate) fn apply_poc_window_policy(
+    state: &mut smithay::wayland::shell::xdg::ToplevelState,
+    fullscreen_size: (i32, i32),
+) {
+    state.states.set(XdgState::Activated);
+    if let Some(size) = poc_window_size() {
+        state.states.unset(XdgState::Fullscreen);
+        state.states.unset(XdgState::Maximized);
+        state.decoration_mode = Some(Mode::ClientSide);
+        state.size = Some(size.into());
+    } else {
+        state.states.set(XdgState::Fullscreen);
+        state.size = Some(fullscreen_size.into());
+    }
+}
+
 /// Default every toplevel to server-side decorations so clients don't bake their own title
 /// bars and borders into the captured image.
 ///
@@ -714,21 +740,21 @@ impl PrimarySelectionHandler for AppState {
 impl XdgDecorationHandler for AppState {
     fn new_decoration(&mut self, toplevel: ToplevelSurface) {
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(Mode::ServerSide);
+            state.decoration_mode = Some(if poc_window_size().is_some() { Mode::ClientSide } else { Mode::ServerSide });
         });
         toplevel.send_configure();
     }
 
     fn request_mode(&mut self, toplevel: ToplevelSurface, mode: Mode) {
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(mode);
+            state.decoration_mode = Some(if poc_window_size().is_some() { Mode::ClientSide } else { mode });
         });
         toplevel.send_configure();
     }
 
     fn unset_mode(&mut self, toplevel: ToplevelSurface) {
         toplevel.with_pending_state(|state| {
-            state.decoration_mode = Some(Mode::ServerSide);
+            state.decoration_mode = Some(if poc_window_size().is_some() { Mode::ClientSide } else { Mode::ServerSide });
         });
         toplevel.send_configure();
     }
@@ -932,9 +958,7 @@ impl CompositorHandler for AppState {
                 };
 
                 toplevel.with_pending_state(|state| {
-                    state.states.set(XdgState::Activated);
-                    state.states.set(XdgState::Fullscreen);
-                    state.size = Some((logical_width, logical_height).into());
+                    apply_poc_window_policy(state, (logical_width, logical_height));
                 });
                 toplevel.send_configure();
 
@@ -985,15 +1009,13 @@ impl CompositorHandler for AppState {
                     });
 
                     if let Some(geo_out) = self.output_nodes[node_idx].logical_geometry() {
-                        let (expected_w, expected_h) = (geo_out.size.w, geo_out.size.h);
+                        let (expected_w, expected_h) = poc_window_size().unwrap_or((geo_out.size.w, geo_out.size.h));
                         let geo = window.geometry();
                         if (geo.size.w - expected_w).abs() > 1
                             || (geo.size.h - expected_h).abs() > 1
                         {
                             toplevel.with_pending_state(|state| {
-                                state.states.set(XdgState::Activated);
-                                state.states.set(XdgState::Fullscreen);
-                                state.size = Some((expected_w, expected_h).into());
+                                apply_poc_window_policy(state, (expected_w, expected_h));
                             });
                             toplevel.send_configure();
                         }
@@ -1589,9 +1611,7 @@ impl AppState {
             )
         };
         toplevel.with_pending_state(|state| {
-            state.states.set(XdgState::Fullscreen);
-            state.states.set(XdgState::Activated);
-            state.size = Some((logical_width, logical_height).into());
+            apply_poc_window_policy(state, (logical_width, logical_height));
         });
         toplevel.send_configure();
     }

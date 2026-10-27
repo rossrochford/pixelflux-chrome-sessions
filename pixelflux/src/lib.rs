@@ -4105,10 +4105,7 @@ fn configure_windows_for_mode(
         }
         if let Some(toplevel) = window.toplevel() {
             toplevel.with_pending_state(|state| {
-                use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State;
-                state.states.set(State::Fullscreen);
-                state.states.set(State::Activated);
-                state.size = Some((logical_width, logical_height).into());
+                wayland::frontend::apply_poc_window_policy(state, (logical_width, logical_height));
             });
             toplevel.send_configure();
         }
@@ -8178,6 +8175,7 @@ fn screenshot_png(py: Python<'_>, display: u32) -> PyResult<Py<PyAny>> {
 /// and import is the one moment no thread exists to race the environment write.
 #[pymodule(gil_used = true)]
 fn pixelflux(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("POC_WINDOWED_POLICY", true)?;
     if std::env::var_os("SVT_LOG").is_none() {
         unsafe { std::env::set_var("SVT_LOG", "1") };
     }
