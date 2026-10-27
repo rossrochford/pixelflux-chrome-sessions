@@ -772,6 +772,12 @@ const NVENC_AV1_RATE: (u64, u64) = (2, 3);
 /// so later sessions declare the weighted level without the refusal.
 static NVENC_AV1_WEIGHTED: AtomicBool = AtomicBool::new(false);
 
+/// Whether the process's driver refused a CBR session's quarter-resolution first pass, as
+/// Kepler's does, taking only a full-resolution one: later sessions code CBR in a single pass
+/// without the refusal. On a Tesla K80 the full-resolution pass encodes a 1080p H.264 frame in
+/// 12.7 ms where the single pass takes 7.3 ms and overshoots its target by 4%.
+static NVENC_SINGLE_PASS: AtomicBool = AtomicBool::new(false);
+
 /// The rate a `codec` level has to admit for a peak of `bps`: AV1's weighed by `NVENC_AV1_RATE`
 /// where the driver holds a level to that share.
 fn level_rate(codec: Codec, bps: u64, weighted: bool) -> u64 {
@@ -2424,7 +2430,14 @@ impl NvencEncoder {
                 let bps = cbr_bps(settings);
                 log_held_rate(settings, bps);
                 config.rcParams.rateControlMode = NV_ENC_PARAMS_RC_MODE::NV_ENC_PARAMS_RC_CBR;
-                config.rcParams.multiPass = tuning.multipass;
+                config.rcParams.multiPass = if tuning.multipass
+                    == NV_ENC_MULTI_PASS::NV_ENC_TWO_PASS_QUARTER_RESOLUTION
+                    && NVENC_SINGLE_PASS.load(Ordering::Relaxed)
+                {
+                    NV_ENC_MULTI_PASS::NV_ENC_MULTI_PASS_DISABLED
+                } else {
+                    tuning.multipass
+                };
                 set_cbr_rate(&mut config.rcParams, bps, cbr_vbv(settings, bps));
                 let lo = codec.hardware_quantizer_bound(Hardware::Nvenc, settings.video_min_qp);
                 if lo > 0 {
@@ -2565,6 +2578,30 @@ impl NvencEncoder {
                     eprintln!(
                         "[NVENC] The driver refused AV1 level {level} at {} kbps; declaring {weighted_level}",
                         config.rcParams.maxBitRate / 1000
+                    );
+                }
+            }
+            if headroom_status == NVENCSTATUS::NV_ENC_ERR_INVALID_PARAM
+                && config.rcParams.multiPass
+                    == NV_ENC_MULTI_PASS::NV_ENC_TWO_PASS_QUARTER_RESOLUTION
+            {
+                (function_list.nvEncDestroyEncoder.unwrap())(encoder_session);
+                encoder_session = ptr::null_mut();
+                if open_fn(&mut session_params, &mut encoder_session) != NVENCSTATUS::NV_ENC_SUCCESS
+                {
+                    (cuda.cuMemFree_v2)(input_device_ptr);
+                    (cuda.cuCtxPopCurrent_v2)(ptr::null_mut());
+                    (cuda.cuDevicePrimaryCtxRelease_v2)(cu_device);
+                    return Err("Failed to reopen the session for a single pass".into());
+                }
+                config.rcParams.multiPass = NV_ENC_MULTI_PASS::NV_ENC_MULTI_PASS_DISABLED;
+                init_params.encodeConfig = &mut config;
+                headroom_status = init_fn(encoder_session, &mut Negotiated::new(init_params).value);
+                if headroom_status == NVENCSTATUS::NV_ENC_SUCCESS
+                    && !NVENC_SINGLE_PASS.swap(true, Ordering::Relaxed)
+                {
+                    eprintln!(
+                        "[NVENC] The driver refused the quarter-resolution first pass; coding CBR in a single pass"
                     );
                 }
             }
